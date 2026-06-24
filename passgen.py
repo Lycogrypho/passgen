@@ -1,8 +1,9 @@
 #!/usr/bin/python3
 from argparse import ArgumentParser, FileType
 from datetime import datetime
+from itertools import permutations
 from sys import stdin, stdout, stderr, exit as sys_exit
-from os.path import isfile
+from os.path import isfile, splitext
 
 
 # OopCompanion:suppressRename
@@ -54,26 +55,41 @@ class PasswordDictGenerator():
               '~','%','&','/','(',')','=','^','[',']','{','}','+','<','>',
               '_','-',';',',','.']
 
-    def __init__(self, _input=None, _output=None, year=[], _all=False, dollar=False, at=False, l337=False, _min: int=1, _max: int=200, quiet=False, verbose=False):
+    def __init__(self, _input=None, _output=None, year=[], _all=False, dollar=False, at=False, l337=False, _min: int=1, _max: int=200, quiet=False, verbose=False, combine=0, chunk_size=0):
         self.input = _input
-        self.output = _output
+        self.output_path = _output                          # str path, or None for stdout
+        self.output = stdout if _output is None else None   # opened lazily in main()
         self._year = year
         self.min = _min
         self.max = _max
+        self.chunk_size = chunk_size
         self.flags = {
             "all": _all,
             "dollar": dollar,
             "at": at,
             "l337": l337,
             "quiet": quiet,
-            "verbose": verbose
+            "verbose": verbose,
+            "combine": combine if combine and combine >= 2 else 0
         }
         self.logger = Logger(level='DEBUG')
 
+    def _write_chunk(self, data, chunk_num): #writes a chunk to a numbered output file and returns its path
+        stem, ext = splitext(self.output_path)
+        path = f"{stem}_{chunk_num:03d}{ext}"
+        with open(path, 'w') as f:
+            f.write('\n'.join(data) + '\n')
+        return path
+
     def main(self):
+        pending = []
+        seen = set()
+        written = 0
+        chunks_written = 0
+        chunked_to_files = self.chunk_size > 0 and self.output_path is not None
+        if not chunked_to_files and self.output_path:
+            self.output = open(self.output_path, 'w')
         try:
-            count=0
-            pset=set()
             if self.flags["all"]: #check if --all flag has been set
                 self._year.append(datetime.now().year) #add the current year to the list
             self._year=list(set(self._year)) #remove duplicates if there's any
@@ -83,8 +99,20 @@ class PasswordDictGenerator():
                 lines=set()
                 for line in self.input: #read from choosen input
                     lines.add(line.strip())
-            except KeyboardInterrupt: #allows the use of Ctrl+C as EOF
+            except KeyboardInterrupt: #allows th78e use of Ctrl+C as EOF
                 self.logger.newline()
+            if not self.flags["quiet"]:
+                self.logger.info(f"Loaded {len(lines)} keyword(s).")
+            if self.flags["combine"] >= 2 and len(lines) >= 2:
+                combined = set()
+                for r in range(2, min(self.flags["combine"], len(lines)) + 1):
+                    for perm in permutations(lines, r):
+                        combined.add(' '.join(perm))
+                lines.update(combined)
+                if not self.flags["quiet"]:
+                    self.logger.info(f"Added {len(combined)} combined keyword(s) ({len(lines)} total).")
+            if not self.flags["quiet"]:
+                self.logger.info("Generating combinations...")
             result=set()
             total=set()
             for line in lines:
@@ -119,18 +147,44 @@ class PasswordDictGenerator():
                     for x in result:
                         total.update(self.base(x))
                     result.update(total)
-                pset.update(result)
-            filtered = [x for x in pset if self.min <= len(x) <= self.max]
-            if filtered:
-                self.output.write('\n'.join(filtered) + '\n')
-            count = len(filtered)
+                new_items = result - seen
+                seen.update(new_items)
+                pending.extend(x for x in new_items if self.min <= len(x) <= self.max)
+                if self.chunk_size > 0 and len(pending) >= self.chunk_size:
+                    chunks_written += 1
+                    chunk_count = len(pending)
+                    if chunked_to_files:
+                        fname = self._write_chunk(pending, chunks_written)
+                    else:
+                        self.output.write('\n'.join(pending) + '\n')
+                        self.output.flush()
+                    pending.clear()
+                    written += chunk_count
+                    if not self.flags["quiet"]:
+                        location = f" to {fname}" if chunked_to_files else ""
+                        self.logger.info(f"Chunk {chunks_written} written{location} ({chunk_count} passwords, {written} total so far).")
+            if pending:
+                if chunked_to_files:
+                    chunks_written += 1
+                    self._write_chunk(pending, chunks_written)
+                else:
+                    self.output.write('\n'.join(pending) + '\n')
+                written += len(pending)
+                pending.clear()
             if not self.flags["quiet"]:
-                self.logger.info(f"Total combinations: {count}")
+                self.logger.info(f"Total combinations: {written}")
         except KeyboardInterrupt:
+            if pending:
+                if chunked_to_files:
+                    chunks_written += 1
+                    self._write_chunk(pending, chunks_written)
+                else:
+                    self.output.write('\n'.join(pending) + '\n')
+                    self.output.flush()
             self.logger.info("\nCatched SIGINT. Exiting...")
             if self.input != stdin:
                 self.input.close()
-            if self.output != stdout:
+            if not chunked_to_files and self.output != stdout:
                 self.output.close()
             sys_exit(0)
 
@@ -163,6 +217,7 @@ class PasswordDictGenerator():
         signs_before = self.signs(w1, 2)
         result.update(signs_after)
         result.update(signs_before)
+        result.update(self.surround(w1))
         if self._year:
             year_after  = self.year(w1, 1)
             year_before = self.year(w1, 2)
@@ -171,11 +226,13 @@ class PasswordDictGenerator():
             for x in year_after:
                 result.update(self.signs(x, 1)) #combination of word+year+sign
                 result.update(self.signs(x, 2)) #combination of sign+word+year
+                result.update(self.surround(x)) #combination of sign+(word+year)+sign
             for x in signs_after:
                 result.update(self.year(x, 1)) #combination of word+sign+year
                 result.update(self.year(x, 2)) #combination of year+word+sign
             for x in year_before:
                 result.update(self.signs(x, 2)) #combination of sign+year+word
+                result.update(self.surround(x)) #combination of sign+(year+word)+sign
             for x in signs_before:
                 result.update(self.year(x, 2)) #combination of year+sign+word
         return result
@@ -202,6 +259,13 @@ class PasswordDictGenerator():
                 result.add(f"{word}{x}") #combination of word+sign
             else:
                 result.add(f"{x}{word}") #combination of sign+word
+        return result
+
+    def surround(self, word): #returns a set with the word surrounded by every pair of signs
+        result=set()
+        for s1 in self._SIGNS:
+            for s2 in self._SIGNS:
+                result.add(f"{s1}{word}{s2}")
         return result
 
     def _generic_sub(self, word, char, rep):
@@ -267,7 +331,7 @@ class PasswordDictGenerator():
 def arg_parser():
     parser = ArgumentParser(description="Creates a custom password wordlist from a set of keywords and phrases.")
     parser.add_argument('-i','--input',dest='_input', type=FileType('r'), default=stdin, nargs='?', help='Input file for keywords. If not specified defaults to stdin.')
-    parser.add_argument('-o','--output', dest='_output', type=FileType('w'), default=stdout, nargs='?', help='Output file. If not specified defaults to stdout.')
+    parser.add_argument('-o','--output', dest='_output', type=str, default=None, nargs='?', help='Output file path. If not specified, defaults to stdout.')
     parser.add_argument('-y','--year', dest='year', type=int, action='append', default=[], const=datetime.now().year, nargs='?', help='Year for making combinations. Can be specified multiple times. If it\'s specified without value defaults to actual year.')
     parser.add_argument('--all', dest='_all', action='store_true', help='Makes all posible combinations. -y value can be specified normally (by default assumes -y).')
     parser.add_argument('-d','--dollar', dest='dollar', action='store_true', help='Replaces s and S with $.')
@@ -275,6 +339,10 @@ def arg_parser():
     parser.add_argument('-l','--l337','--l33t', dest='l337', action='store_true', help='Replaces letters with numbers.')
     parser.add_argument('-min','--minimum',dest='_min',action='store', type=int, default=1, help='Minimum length of password. Default=1')
     parser.add_argument('-max','--maximum',dest='_max',action='store', type=int, default=200, help='Maximum length of password. Default=200')
+    parser.add_argument('-c','--combine', dest='combine', type=int, nargs='?', const=2, default=0,
+                        help='Combine input keywords into groups of N words before generating (2 or 3). Default when specified: 2.')
+    parser.add_argument('-s','--chunk-size', dest='chunk_size', type=int, nargs='?', const=1000000, default=0,
+                        help='When used with -o, write each chunk of N passwords to a separate numbered file. Default when specified: 1000000.')
     group=parser.add_mutually_exclusive_group()
     group.add_argument('-q','--quiet',dest='quiet',action='store_true', help='Suppresses informative output.')
     group.add_argument('-v','--verbose',dest='verbose',action='store_true', help='Adds more informative output.')
