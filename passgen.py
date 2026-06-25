@@ -1,12 +1,16 @@
 #!/usr/bin/python3
+import json
 from argparse import ArgumentParser, FileType
 from datetime import datetime
-from itertools import permutations
+from itertools import permutations, product
 from sys import stdin, stdout, stderr, exit as sys_exit
-from os.path import isfile, splitext
+from os.path import isfile, splitext, dirname, abspath, join
 
 
 # OopCompanion:suppressRename
+
+# Sentinel meaning "-sp was given without a name": use the first preset in the config.
+_USE_FIRST_PRESET = "\x00first"
 
 
 class Logger():
@@ -51,11 +55,39 @@ class Logger():
 
 class PasswordDictGenerator():
 
+    # Built-in fallback sign list, used when passgen.json has no "sign_sets" section.
+    # Sign sets are normally selected from the config via -ss/--sign-set.
     _SIGNS = ['*','#',"'",'?','¡','¿','!','\\','|','º','ª','"','@','·','$',
               '~','%','&','/','(',')','=','^','[',']','{','}','+','<','>',
               '_','-',';',',','.']
 
-    def __init__(self, _input=None, _output=None, year=[], _all=False, dollar=False, at=False, l337=False, _min: int=1, _max: int=200, quiet=False, verbose=False, combine=0, chunk_size=0):
+    _WARN_THRESHOLD = 1_000_000   # projected candidates per input word before we warn
+    _HARD_CAP = 50_000_000        # projected candidates per input word that we refuse without --force
+    _FLUSH_BATCH = 100_000        # candidates buffered before streaming a write when not chunking to files
+
+    # Fallback substitution presets used when no passgen.json is found next to the script.
+    # Rules are case-sensitive (note both 'a' and 'A' entries) and may be many-to-one
+    # (i/I/l/L -> 1) or one-to-many (a -> 4 or @, s -> 5 or $). The first preset is the default.
+    _BUILTIN_PRESETS = {
+        "leet": [
+            {"from": "a", "to": "4"}, {"from": "e", "to": "3"},
+            {"from": "i", "to": "1"}, {"from": "o", "to": "0"},
+            {"from": "s", "to": "5"}, {"from": "t", "to": "7"},
+        ],
+        "extended": [
+            {"from": "a", "to": "4"}, {"from": "a", "to": "@"},
+            {"from": "A", "to": "4"}, {"from": "A", "to": "@"},
+            {"from": "e", "to": "3"}, {"from": "E", "to": "3"},
+            {"from": "i", "to": "1"}, {"from": "I", "to": "1"},
+            {"from": "l", "to": "1"}, {"from": "L", "to": "1"},
+            {"from": "o", "to": "0"}, {"from": "O", "to": "0"},
+            {"from": "s", "to": "5"}, {"from": "s", "to": "$"},
+            {"from": "S", "to": "5"}, {"from": "S", "to": "$"},
+            {"from": "t", "to": "7"}, {"from": "T", "to": "7"},
+        ],
+    }
+
+    def __init__(self, _input=None, _output=None, year=[], _all=False, dollar=False, at=False, l337=False, _min: int=1, _max: int=200, quiet=False, verbose=False, combine=0, chunk_size=0, force=False, sub_preset=None, sign_set=None):
         self.input = _input
         self.output_path = _output                          # str path, or None for stdout
         self.output = stdout if _output is None else None   # opened lazily in main()
@@ -70,9 +102,18 @@ class PasswordDictGenerator():
             "l337": l337,
             "quiet": quiet,
             "verbose": verbose,
-            "combine": combine if combine and combine >= 2 else 0
+            "combine": combine if combine and combine >= 2 else 0,
+            "force": force
         }
+        self._psf = None  # per-cased-form decoration factor, computed once in main() after year dedup
+        self._config = None               # parsed passgen.json, lazily loaded and cached
         self.logger = Logger(level='DEBUG')
+        self.sub_preset_name = None       # name of the active substitution preset, for logging
+        self.sub_rules = {}               # {from_char: [to_char, ...]}; non-empty enables substitution mode
+        self._init_sub_rules(sub_preset)
+        self.sign_set_name = None         # name of the active sign set, for logging
+        self.signs_list = []              # active list of punctuation signs (set from config or built-in)
+        self._init_signs(sign_set)
 
     def _write_chunk(self, data, chunk_num): #writes a chunk to a numbered output file and returns its path
         stem, ext = splitext(self.output_path)
@@ -81,18 +122,86 @@ class PasswordDictGenerator():
             f.write('\n'.join(data) + '\n')
         return path
 
+    def _load_config(self): #parses passgen.json next to the script once (cached); returns {} if absent or invalid
+        if self._config is None:
+            self._config = {}
+            path = join(dirname(abspath(__file__)), 'passgen.json')
+            if isfile(path):
+                try:
+                    with open(path, encoding='utf-8') as f:
+                        data = json.load(f)
+                    if isinstance(data, dict):
+                        self._config = data
+                    else:
+                        self.logger.warning(f'{path} is not a JSON object; ignoring it.')
+                except (json.JSONDecodeError, OSError) as e:
+                    self.logger.warning(f'Could not read {path} ({e}); ignoring it.')
+        return self._config
+
+    def _presets(self): #the substitution presets from config, or the built-in fallback
+        presets = self._load_config().get('presets')
+        if isinstance(presets, dict) and presets:
+            return presets
+        return dict(self._BUILTIN_PRESETS)
+
+    def _sign_sets(self): #the sign sets from config, or a single built-in fallback set
+        sign_sets = self._load_config().get('sign_sets')
+        if isinstance(sign_sets, dict) and sign_sets:
+            return sign_sets
+        return {"default": list(self._SIGNS)}
+
+    def _init_sub_rules(self, sub_preset): #builds self.sub_rules from the selected preset (None leaves substitution mode off)
+        if sub_preset is None:
+            return
+        presets = self._presets()
+        name = next(iter(presets)) if sub_preset == _USE_FIRST_PRESET else sub_preset
+        if name not in presets:
+            self.logger.error(f'Unknown sub-preset "{name}". Available: {", ".join(presets)}')
+            sys_exit(1)
+        rules = {}
+        for rule in presets[name]:
+            frm, to = rule.get("from"), rule.get("to")
+            if not frm or to is None: #need a non-empty source char and a replacement
+                continue
+            targets = rules.setdefault(frm, [])
+            if to not in targets:
+                targets.append(to)
+        self.sub_rules = rules
+        self.sub_preset_name = name
+
+    def _init_signs(self, sign_set): #selects the active sign list (None uses the first set in config / built-in)
+        sign_sets = self._sign_sets()
+        name = next(iter(sign_sets)) if sign_set is None else sign_set
+        if name not in sign_sets:
+            self.logger.error(f'Unknown sign-set "{name}". Available: {", ".join(sign_sets)}')
+            sys_exit(1)
+        chars = [str(c) for c in sign_sets[name] if c != ""] #drop empty entries
+        if not chars:
+            self.logger.error(f'Sign-set "{name}" is empty.')
+            sys_exit(1)
+        self.signs_list = chars
+        self.sign_set_name = name
+
     def main(self):
         pending = []
-        seen = set()
         written = 0
         chunks_written = 0
         chunked_to_files = self.chunk_size > 0 and self.output_path is not None
+        flush_batch = self.chunk_size if self.chunk_size > 0 else self._FLUSH_BATCH
         if not chunked_to_files and self.output_path:
             self.output = open(self.output_path, 'w')
         try:
             if self.flags["all"]: #check if --all flag has been set
                 self._year.append(datetime.now().year) #add the current year to the list
             self._year=list(set(self._year)) #remove duplicates if there's any
+            self._psf = self._decoration_factor() #fixed per-cased-form expansion factor for projection
+            if not self.flags["quiet"]:
+                self.logger.info(f'Sign set "{self.sign_set_name}" active ({len(self.signs_list)} sign(s)).')
+            if self.sub_rules:
+                if not self.flags["quiet"]:
+                    self.logger.info(f'Substitution preset "{self.sub_preset_name}" active ({sum(len(v) for v in self.sub_rules.values())} rule(s)).')
+                if (self.flags["l337"] or self.flags["all"] or self.flags["dollar"] or self.flags["at"]) and not self.flags["quiet"]:
+                    self.logger.warning("Substitution preset active: -l/--all/-d/-at substitutions are disabled to avoid duplication.")
             if self.input == stdin and not self.flags["quiet"]:
                 self.logger.info("Insert input, one per line. Finish with a newline plus ctrl+c:")
             try:
@@ -113,56 +222,25 @@ class PasswordDictGenerator():
                     self.logger.info(f"Added {len(combined)} combined keyword(s) ({len(lines)} total).")
             if not self.flags["quiet"]:
                 self.logger.info("Generating combinations...")
-            result=set()
-            total=set()
             for line in lines:
                 if self.flags["verbose"]:
                     self.logger.debug(f"Working on: {line}")
-                result.clear()
-                words = line.split()
-                if words: #check for avoid empty lines
-                    for i in range(len(words)):
-                        w = words.pop(0)
-                        words.append(w.capitalize())
-                    w = ''.join(words)
-                    result.add(w)
-                    result.add(w.lower())
-                    if len(words) > 1: #check if it's a single word or a sentence
-                        result.add('_'.join(words))
-                        result.add('_'.join(words).lower())
-                    if self.flags["l337"] or self.flags["all"]: #check if l337 or --all flags has been set
-                        result.update(self.f_l337(w))
-                    total.clear()
-                    leet_active = self.flags["l337"] or self.flags["all"]
-                    if self.flags["dollar"] and not leet_active: #check if dollar flag has been set (skip if leet handles it)
-                        for x in result:
-                            if 's' in x.lower():
-                                total.add(self.dollar(x))
-                    if self.flags["at"] and not leet_active: #check if at flag has been set (skip if leet handles it)
-                        for x in result:
-                            if 'a' in x.lower():
-                                total.add(self.at(x))
-                    result.update(total)
-                    total.clear()
-                    for x in result:
-                        total.update(self.base(x))
-                    result.update(total)
-                new_items = result - seen
-                seen.update(new_items)
-                pending.extend(x for x in new_items if self.min <= len(x) <= self.max)
-                if self.chunk_size > 0 and len(pending) >= self.chunk_size:
-                    chunks_written += 1
-                    chunk_count = len(pending)
-                    if chunked_to_files:
-                        fname = self._write_chunk(pending, chunks_written)
-                    else:
-                        self.output.write('\n'.join(pending) + '\n')
-                        self.output.flush()
-                    pending.clear()
-                    written += chunk_count
-                    if not self.flags["quiet"]:
-                        location = f" to {fname}" if chunked_to_files else ""
-                        self.logger.info(f"Chunk {chunks_written} written{location} ({chunk_count} passwords, {written} total so far).")
+                for candidate in self.generate_for_line(line): #stream candidates one at a time
+                    if self.min <= len(candidate) <= self.max:
+                        pending.append(candidate)
+                        if len(pending) >= flush_batch:
+                            chunks_written += 1
+                            chunk_count = len(pending)
+                            if chunked_to_files:
+                                fname = self._write_chunk(pending, chunks_written)
+                            else:
+                                self.output.write('\n'.join(pending) + '\n')
+                                self.output.flush()
+                            pending.clear()
+                            written += chunk_count
+                            if not self.flags["quiet"]:
+                                location = f" to {fname}" if chunked_to_files else ""
+                                self.logger.info(f"Chunk {chunks_written} written{location} ({chunk_count} passwords, {written} total so far).")
             if pending:
                 if chunked_to_files:
                     chunks_written += 1
@@ -189,18 +267,98 @@ class PasswordDictGenerator():
             sys_exit(0)
 
 
-    def base(self, w):
-        result=self.year_signs(w)
-        result.update(self.year_signs(w.lower()))
-        result.update(self.year_signs(w.upper()))
+    def _decoration_factor(self): #upper-bound estimate of candidates year_signs() produces for one word (projection only)
+        s = len(self.signs_list)
+        factor = (2 * s) + (s * s)           # year_signs without years: signs + surround
+        if self._year:
+            yv = 4 * len(self._year)         # year variants per direction
+            factor += 2 * yv                 # bare year_after + year_before
+            factor += yv * (2 * s + s * s)   # year_after -> signs + surround
+            factor += s * 2 * yv             # signs_after -> year both modes
+            factor += yv * (s + s * s)       # year_before -> signs(mode2) + surround
+            factor += s * yv                 # signs_before -> year(mode2)
+        return factor
+
+    def _cased_forms(self, w): #the distinct cased forms of a seed that get decorated by base()
+        forms = [w, w.lower(), w.upper()]
         if not w.istitle() or w.find('_') != -1: #avoid duplicate capitalize() when w is already a single title-cased word
-            result.update(self.year_signs(w.capitalize()))
+            forms.append(w.capitalize())
         if self.hasVowel(w):
             uv = self.upperVowel(w)
-            result.update(self.year_signs(uv))
+            forms.append(uv)
             if w.capitalize() != uv.swapcase():
-                result.update(self.year_signs(uv.swapcase()))
-        return result
+                forms.append(uv.swapcase())
+        return forms
+
+    def _sub_count(self, word): #number of substitution combinations (including the original) for projection
+        n = 1
+        for ch in word:
+            opts = self.sub_rules.get(ch)
+            if opts:
+                n *= 1 + len(opts)
+        return n
+
+    def apply_subs(self, word): #per-instance, case-sensitive substitutions; yields every changed variant (not the original)
+        choices = []
+        for ch in word:
+            opts = self.sub_rules.get(ch)
+            choices.append((ch, *opts) if opts else (ch,))
+        for combo in product(*choices):
+            cand = ''.join(combo)
+            if cand != word:
+                yield cand
+
+    def generate_for_line(self, line): #lazily yields every candidate for one input line (duplicates possible by design)
+        words = line.split()
+        if not words: #skip empty lines
+            return
+        for _ in range(len(words)):
+            w = words.pop(0)
+            words.append(w.capitalize())
+        w = ''.join(words)
+        seeds = {w, w.lower()}
+        if len(words) > 1: #multi-word phrase: also offer underscore-joined variants
+            joined = '_'.join(words)
+            seeds.add(joined)
+            seeds.add(joined.lower())
+        sub_active = bool(self.sub_rules)
+        leet_active = (self.flags["l337"] or self.flags["all"]) and not sub_active
+        if leet_active:
+            seeds.update(self.f_l337(w))
+        elif not sub_active: #dollar/at only when neither leet nor substitution mode is active
+            extra = set()
+            if self.flags["dollar"]:
+                for x in seeds:
+                    if 's' in x.lower():
+                        extra.add(self.dollar(x))
+            if self.flags["at"]:
+                for x in seeds:
+                    if 'a' in x.lower():
+                        extra.add(self.at(x))
+            seeds.update(extra)
+        decoration = self._psf or self._decoration_factor()
+        if sub_active: #substitutions multiply per cased form (case-sensitive), counted across the actual forms
+            base_words = sum(self._sub_count(cf) for seed in seeds for cf in self._cased_forms(seed))
+        else:
+            base_words = sum(1 for seed in seeds for _cf in self._cased_forms(seed))
+        projected = base_words * decoration
+        if projected > self._HARD_CAP and not self.flags["force"]:
+            if not self.flags["quiet"]:
+                self.logger.warning(f'Skipping "{line}": projected ~{projected:,} candidates exceed the cap ({self._HARD_CAP:,}). Use --force to override.')
+            return
+        if projected > self._WARN_THRESHOLD and not self.flags["quiet"]:
+            self.logger.warning(f'"{line}" will expand to ~{projected:,} candidates before length filtering.')
+        for seed in seeds:
+            yield seed
+            yield from self.base(seed)
+
+    def base(self, w): #lazily yields the cased + sign/year decorated forms of a seed word
+        for cf in self._cased_forms(w):
+            yield from self.year_signs(cf)
+            if self.sub_rules: #per-instance, case-sensitive substitution variants of this cased form
+                for sub in self.apply_subs(cf):
+                    yield sub                       # bare substituted word
+                    yield from self.year_signs(sub) # and its sign/year decorations
 
     def hasVowel(self, word): #simple function that returns if a word has a vowel.
         return any(x in word.lower() for x in ('a', 'e', 'i', 'o', 'u'))
@@ -211,62 +369,55 @@ class PasswordDictGenerator():
             _word = _word.replace(char, char.upper())
         return _word
 
-    def year_signs(self, w1): #returns a set with combinations of the word and the signs and, if specified, the year(s)
-        result=set()
-        signs_after  = self.signs(w1, 1)
-        signs_before = self.signs(w1, 2)
-        result.update(signs_after)
-        result.update(signs_before)
-        result.update(self.surround(w1))
+    def year_signs(self, w1): #lazily yields combinations of the word with signs and, if specified, the year(s)
+        signs_after  = list(self.signs(w1, 1)) #materialized: iterated more than once below
+        signs_before = list(self.signs(w1, 2))
+        yield from signs_after
+        yield from signs_before
+        yield from self.surround(w1)
         if self._year:
-            year_after  = self.year(w1, 1)
-            year_before = self.year(w1, 2)
-            result.update(year_after)
-            result.update(year_before)
+            year_after  = list(self.year(w1, 1)) #materialized: iterated more than once below
+            year_before = list(self.year(w1, 2))
+            yield from year_after
+            yield from year_before
             for x in year_after:
-                result.update(self.signs(x, 1)) #combination of word+year+sign
-                result.update(self.signs(x, 2)) #combination of sign+word+year
-                result.update(self.surround(x)) #combination of sign+(word+year)+sign
+                yield from self.signs(x, 1) #combination of word+year+sign
+                yield from self.signs(x, 2) #combination of sign+word+year
+                yield from self.surround(x) #combination of sign+(word+year)+sign
             for x in signs_after:
-                result.update(self.year(x, 1)) #combination of word+sign+year
-                result.update(self.year(x, 2)) #combination of year+word+sign
+                yield from self.year(x, 1) #combination of word+sign+year
+                yield from self.year(x, 2) #combination of year+word+sign
             for x in year_before:
-                result.update(self.signs(x, 2)) #combination of sign+year+word
-                result.update(self.surround(x)) #combination of sign+(year+word)+sign
+                yield from self.signs(x, 2) #combination of sign+year+word
+                yield from self.surround(x) #combination of sign+(year+word)+sign
             for x in signs_before:
-                result.update(self.year(x, 2)) #combination of year+sign+word
-        return result
+                yield from self.year(x, 2) #combination of year+sign+word
 
-    def year(self, word,mode): #returns a set with combinations of the word and the year(s)
-        total=set()
+    def year(self, word,mode): #lazily yields combinations of the word and the year(s)
         for y in self._year:
+            sy = str(y)
             if mode == 1:
-                total.add(word+str(y)) #combination of word+year with 4 digits
-                total.add(word+str(y)[::-1]) #combination of word + reversed year
-                total.add(word+str(y)[2:])  #combination of word+year with 2 digits
-                total.add(word+str(y)[2:][::-1]) #combination of word + reversed year with 2 digits
+                yield word+sy          #combination of word+year with 4 digits
+                yield word+sy[::-1]    #combination of word + reversed year
+                yield word+sy[2:]      #combination of word+year with 2 digits
+                yield word+sy[2:][::-1] #combination of word + reversed year with 2 digits
             else:
-                total.add(str(y)+word) #combination of year+word with 4 digits
-                total.add(str(y)[::-1]+word) #combination of reversed year with 4 digits + word
-                total.add(str(y)[2:]+word) #combination of year with 2 digits + word
-                total.add(str(y)[2:][::-1]+word) #combination of reversed year with 2 digits + word
-        return total
+                yield sy+word          #combination of year+word with 4 digits
+                yield sy[::-1]+word    #combination of reversed year with 4 digits + word
+                yield sy[2:]+word      #combination of year with 2 digits + word
+                yield sy[2:][::-1]+word #combination of reversed year with 2 digits + word
 
-    def signs(self, word, mode): #returns a set with combinations of the word and signs
-        result=set()
-        for x in self._SIGNS:
+    def signs(self, word, mode): #lazily yields combinations of the word and signs
+        for x in self.signs_list:
             if mode == 1:
-                result.add(f"{word}{x}") #combination of word+sign
+                yield f"{word}{x}" #combination of word+sign
             else:
-                result.add(f"{x}{word}") #combination of sign+word
-        return result
+                yield f"{x}{word}" #combination of sign+word
 
-    def surround(self, word): #returns a set with the word surrounded by every pair of signs
-        result=set()
-        for s1 in self._SIGNS:
-            for s2 in self._SIGNS:
-                result.add(f"{s1}{word}{s2}")
-        return result
+    def surround(self, word): #lazily yields the word surrounded by every pair of signs
+        for s1 in self.signs_list:
+            for s2 in self.signs_list:
+                yield f"{s1}{word}{s2}"
 
     def _generic_sub(self, word, char, rep):
         if word is not None:
@@ -337,12 +488,17 @@ def arg_parser():
     parser.add_argument('-d','--dollar', dest='dollar', action='store_true', help='Replaces s and S with $.')
     parser.add_argument('-at', dest='at', action='store_true', help='Replaces a and A with @.')
     parser.add_argument('-l','--l337','--l33t', dest='l337', action='store_true', help='Replaces letters with numbers.')
+    parser.add_argument('-sp','--sub-preset', dest='sub_preset', nargs='?', const=_USE_FIRST_PRESET, default=None,
+                        help='Enable per-instance, case-sensitive substitutions from a preset in passgen.json (or built-in). Without a name, uses the first preset. Mutually exclusive with -l/--all/-d/-at.')
+    parser.add_argument('-ss','--sign-set', dest='sign_set', default=None,
+                        help='Name of the sign set to use from passgen.json (or built-in). Defaults to the first sign set.')
     parser.add_argument('-min','--minimum',dest='_min',action='store', type=int, default=1, help='Minimum length of password. Default=1')
     parser.add_argument('-max','--maximum',dest='_max',action='store', type=int, default=200, help='Maximum length of password. Default=200')
     parser.add_argument('-c','--combine', dest='combine', type=int, nargs='?', const=2, default=0,
                         help='Combine input keywords into groups of N words before generating (2 or 3). Default when specified: 2.')
     parser.add_argument('-s','--chunk-size', dest='chunk_size', type=int, nargs='?', const=1000000, default=0,
                         help='When used with -o, write each chunk of N passwords to a separate numbered file. Default when specified: 1000000.')
+    parser.add_argument('-f','--force', dest='force', action='store_true', help='Generate even for input words whose projected expansion exceeds the safety cap.')
     group=parser.add_mutually_exclusive_group()
     group.add_argument('-q','--quiet',dest='quiet',action='store_true', help='Suppresses informative output.')
     group.add_argument('-v','--verbose',dest='verbose',action='store_true', help='Adds more informative output.')

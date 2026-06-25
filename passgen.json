@@ -1,0 +1,29 @@
+{
+  "_comment": "passgen configuration. 'presets' feeds -sp/--sub-preset: each preset is a list of {from, to} rules applied per-instance and case-sensitively (list 'a' and 'A' separately); rules may be many-to-one (i, I, l, L -> 1) or one-to-many (a -> 4 or @). 'sign_sets' feeds -ss/--sign-set: each entry is a list of punctuation characters appended/prepended/surrounding every word. The first entry in each section is the default when the flag is omitted (or given without a name, for -sp).",
+  "sign_sets": {
+    "default": ["*","#","'","?","¡","¿","!","\\","|","º","ª","\"","@","·","$","~","%","&","/","(",")","=","^","[","]","{","}","+","<",">","_","-",";",",","."],
+    "common": ["!","@","#","$","%","&","*","-","_","?","."],
+    "minimal": ["!","_","."]
+  },
+  "presets": {
+    "leet": [
+      {"from": "a", "to": "4"},
+      {"from": "e", "to": "3"},
+      {"from": "i", "to": "1"},
+      {"from": "o", "to": "0"},
+      {"from": "s", "to": "5"},
+      {"from": "t", "to": "7"}
+    ],
+    "extended": [
+      {"from": "a", "to": "4"}, {"from": "a", "to": "@"},
+      {"from": "A", "to": "4"}, {"from": "A", "to": "@"},
+      {"from": "e", "to": "3"}, {"from": "E", "to": "3"},
+      {"from": "i", "to": "1"}, {"from": "I", "to": "1"},
+      {"from": "l", "to": "1"}, {"from": "L", "to": "1"},
+      {"from": "o", "to": "0"}, {"from": "O", "to": "0"},
+      {"from": "s", "to": "5"}, {"from": "s", "to": "$"},
+      {"from": "S", "to": "5"}, {"from": "S", "to": "$"},
+      {"from": "t", "to": "7"}, {"from": "T", "to": "7"}
+    ]
+  }
+}
