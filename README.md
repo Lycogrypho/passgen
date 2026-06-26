@@ -123,6 +123,53 @@ Practical notes:
 - hashcat's `--status` flag shows progress and estimated time to completion.
 - The header-only approach is safe — you're not touching the actual encrypted data on the volume.
 
+## Automating the search with passtest
+
+I found that the wordlists generated with PassGen may easily explode in milions of variations, and running hashcat by hand against each chunk and each mode gets tedious fast, especially when PassGen is still streaming new `wordlist_###.txt` files with `-s`.
+
+In my lziness, I came with `passtest.py` to automates the whole loop:
+
+It reads a `passtest.json` configuration file (next to the script, or passed with `-c`) that specifies at least:
+- `dict_dir` — the directory to monitor for wordlist chunks;
+- `wordlist` — the base name, so it watches for `wordlist_###.txt`;
+- `header_bin` — the volume header extracted in Step 1;
+- `hcat_path` — the path to the hashcat executable;
+- a list of hashcat jobs (each with its `mode`, an optional GPU `device`, and optional extra `args`).
+
+What it does:
+1. **Monitors** `dict_dir` for `wordlist_###.txt` files (skipping ones already marked `DONE_`), oldest first.
+2. For each chunk it **runs hashcat** once per configured job against `header_bin`. Jobs pinned to different GPUs run **in parallel** (one hashcat instance per device); jobs sharing a device run sequentially.
+3. If a password is **found**, it prints it to stdout, records it in the found file, and exits.
+4. Otherwise it marks the chunk done by renaming it `DONE_wordlist_###.txt` and moves on to the next. When no chunk is left it keeps polling, so you can start `passtest` as soon as PassGen writes its first chunk and let the two run side by side.
+
+Example: start PassGen streaming chunks, then start the watcher:
+
+``python passgen.py -i keywords.txt --all -s -o wordlists/wordlist.txt``
+
+``python passtest.py``
+
+A minimal `passtest.json` for a VeraCrypt volume across three GPUs:
+
+```json
+{
+  "dict_dir": "wordlists",
+  "wordlist": "wordlist",
+  "header_bin": "header.bin",
+  "hcat_path": "hashcat",
+  "jobs": [
+    {"mode": 13711, "device": 1, "args": []},
+    {"mode": 13721, "device": 2, "args": []},
+    {"mode": 13751, "device": 3, "args": ["-O"]}
+  ]
+}
+```
+
+Notes:
+- Running several hashcat instances at once only helps when each targets a **different physical GPU** (`device`). On a single GPU the instances just contend for it, so give every job the same (or no) `device` and they run one after another.
+- The example mode numbers and device ids are placeholders — set them to your volume's actual hashing algorithm and your real GPU ids (`hashcat -I` lists devices).
+- passtest runs on both Windows and Linux and uses only the Python 3 standard library.
+
+
 ## Disclaimer
 
 This project was created for personal use, to recover the password of an owned USB drive.
