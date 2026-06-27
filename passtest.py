@@ -23,7 +23,6 @@ import re
 import sys
 import json
 import time
-import shutil
 import logging
 import argparse
 import threading
@@ -50,14 +49,14 @@ def setup_logging(verbose=False):
     LOG.setLevel(logging.DEBUG if verbose else logging.INFO)
 
 
-class PassTester:
+class Passtest:
 
     def __init__(self, config, config_dir):
         self.config_dir = Path(config_dir)
         self.dict_dir = self._resolve(config["dict_dir"])
         self.stem = str(config["wordlist"])
         self.header_bin = self._resolve(config["header_bin"])
-        self.hcat_path = str(config["hcat_path"])
+        self.hcat_path: str = str(config["hcat_path"])
         self.poll_interval = float(config.get("poll_interval", 5))
         self.found_file = self._resolve(config.get("found_file", "found.txt"))
         self.out_dir = self._resolve(config.get("out_dir", ".passtest_out"))
@@ -85,16 +84,21 @@ class PassTester:
                 if mode is None:
                     LOG.warning("Skipping job without a 'mode': %r", j)
                     continue
+                rules_raw = j.get("rules", [])
+                if isinstance(rules_raw, str):
+                    rules_raw = [rules_raw]
                 jobs.append({"mode": int(mode),
                              "device": j.get("device"),
-                             "args": [str(a) for a in j.get("args", [])]})
+                             "args": [str(a) for a in j.get("args", [])],
+                             "rules": [str(self._resolve(r)) for r in rules_raw]})
         else:  # fallback: a flat 'modes' list, optionally spread over 'devices'
             modes = config.get("modes", [])
             devices = config.get("devices") or [None]
             for i, mode in enumerate(modes):
                 jobs.append({"mode": int(mode),
                              "device": devices[i % len(devices)],
-                             "args": []})
+                             "args": [],
+                             "rules": []})
         if not jobs:
             LOG.error("No 'jobs' or 'modes' defined in configuration.")
             sys.exit(1)
@@ -116,9 +120,11 @@ class PassTester:
             if not Path(exe).is_file():
                 LOG.error("hashcat executable not found: %s", exe)
                 sys.exit(1)
-        elif shutil.which(exe) is None:
-            LOG.error("hashcat not found on PATH: %s", exe)
-            sys.exit(1)
+        else:
+            path_dirs = (os.environ.get("PATH") or "").split(os.pathsep)
+            if not any(os.access(os.path.join(d, exe), os.X_OK) for d in path_dirs):
+                LOG.error("hashcat not found on PATH: %s", exe)
+                sys.exit(1)
         if not self.dict_dir.exists():
             LOG.warning("dict_dir does not exist yet: %s (will keep polling)", self.dict_dir)
 
@@ -228,6 +234,8 @@ class PassTester:
                "-o", str(outfile)]
         if job["device"] is not None:
             cmd += ["-d", str(job["device"])]
+        for rule in job.get("rules", []):
+            cmd += ["-r", rule]
         cmd += job["args"]
         cmd += self.extra_global
         cmd += [str(self.header_bin), str(wl)]     # hash (header) then dictionary
@@ -365,7 +373,7 @@ def main():
         sys.exit(1)
 
     cfg = load_config(config_path)
-    tester = PassTester(cfg, config_path.resolve().parent)
+    tester = Passtest(cfg, config_path.resolve().parent)
     try:
         tester.run()
     except KeyboardInterrupt:

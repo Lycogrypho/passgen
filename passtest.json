@@ -1,16 +1,19 @@
 {
   "_comment": "passtest configuration. 'dict_dir' is watched for '<wordlist>_###.txt' chunks (as produced by passgen -o <wordlist>.txt -s). Each 'jobs' entry runs hashcat with mode '-m', optional 'device' (-d, a GPU id), and optional extra 'args', against 'header_bin' (the dd-extracted volume header). Jobs on distinct devices run in parallel (one hashcat instance per GPU); jobs sharing a device run sequentially. Common TrueCrypt modes: 6211/6212/6213 (RIPEMD160), 6221/6222/6223 (SHA512), 6231+ (Whirlpool). VeraCrypt: 13711-13713 (RIPEMD160), 13721-13723 (SHA512), 13751-13753 (SHA256), 13731+ (Whirlpool). As a fallback you may instead supply a flat 'modes': [..] list plus 'devices': [..] and 'hcat_args': [..].",
-  "dict_dir": "wordlists",
+  "dict_dir": ".\\test",
   "wordlist": "wordlist",
-  "header_bin": "header.bin",
-  "hcat_path": "hashcat",
+  "header_bin": ".\\test\\header.bin",
+  "hcat_path": "C:\\_MiM\\Programmi\\hashcat-7.1.2\\hashcat.exe",
   "poll_interval": 5,
-  "found_file": "found.txt",
-  "out_dir": ".passtest_out",
+  "found_file": ".\\test\\found.txt",
+  "out_dir": ".\\test\\passtest_out",
   "hcat_args": ["-w", "3"],
   "jobs": [
-    {"mode": 13711, "device": 1, "args": []},
-    {"mode": 13721, "device": 2, "args": []},
-    {"mode": 13751, "device": 3, "args": ["-O"]}
+    {"mode": 6213, "device": 1, "args": []},
+    {"mode": 6223, "device": 1, "args": []},
+    {"mode": 6233, "device": 1, "args": []},
+    {"mode": 6243, "device": 1, "args": []},
+    {"mode": 6253, "device": 1, "args": []},
+    {"mode": 6263, "device": 1, "args": []}
   ]
 }

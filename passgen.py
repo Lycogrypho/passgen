@@ -11,6 +11,8 @@ from os.path import isfile, splitext, dirname, abspath, join
 
 # Sentinel meaning "-sp was given without a name": use the first preset in the config.
 _USE_FIRST_PRESET = "\x00first"
+# Sentinel meaning "-af was given without a name": use the first affix set in the config.
+_USE_FIRST_AFFIX_SET = "\x00first_affix"
 
 
 class Logger():
@@ -87,11 +89,11 @@ class PasswordDictGenerator():
         ],
     }
 
-    def __init__(self, _input=None, _output=None, year=[], _all=False, dollar=False, at=False, l337=False, _min: int=1, _max: int=200, quiet=False, verbose=False, combine=0, chunk_size=0, force=False, sub_preset=None, sign_set=None):
+    def __init__(self, _input=None, _output=None, year=None, _all=False, dollar=False, at=False, l337=False, _min: int=1, _max: int=200, quiet=False, verbose=False, combine=0, chunk_size=0, force=False, sub_preset=None, sign_set=None, affix_set=None):
         self.input = _input
         self.output_path = _output                          # str path, or None for stdout
         self.output = stdout if _output is None else None   # opened lazily in main()
-        self._year = year
+        self._year = list(year) if year is not None else []
         self.min = _min
         self.max = _max
         self.chunk_size = chunk_size
@@ -109,11 +111,14 @@ class PasswordDictGenerator():
         self._config = None               # parsed passgen.json, lazily loaded and cached
         self.logger = Logger(level='DEBUG')
         self.sub_preset_name = None       # name of the active substitution preset, for logging
-        self.sub_rules = {}               # {from_char: [to_char, ...]}; non-empty enables substitution mode
+        self.sub_rules: dict[str, list[str]] = {}  # {from_char: [to_char, ...]}; non-empty enables substitution mode
         self._init_sub_rules(sub_preset)
         self.sign_set_name = None         # name of the active sign set, for logging
         self.signs_list = []              # active list of punctuation signs (set from config or built-in)
         self._init_signs(sign_set)
+        self.affix_set_name = None        # name of the active affix set, for logging
+        self.affixes_list = []            # active list of number/string affixes; empty = disabled
+        self._init_affixes(affix_set)
 
     def _write_chunk(self, data, chunk_num): #writes a chunk to a numbered output file and returns its path
         stem, ext = splitext(self.output_path)
@@ -154,7 +159,7 @@ class PasswordDictGenerator():
         if sub_preset is None:
             return
         presets = self._presets()
-        name = next(iter(presets)) if sub_preset == _USE_FIRST_PRESET else sub_preset
+        name = next(iter(presets)) if sub_preset is _USE_FIRST_PRESET else str(sub_preset)
         if name not in presets:
             self.logger.error(f'Unknown sub-preset "{name}". Available: {", ".join(presets)}')
             sys_exit(1)
@@ -182,6 +187,27 @@ class PasswordDictGenerator():
         self.signs_list = chars
         self.sign_set_name = name
 
+    def _affix_sets(self): #the affix sets from config, or a single built-in fallback set
+        sets = self._load_config().get('affix_sets')
+        if isinstance(sets, dict) and sets:
+            return sets
+        return {"default": ["1", "12", "123", "1234", "0", "00", "01", "007", "69", "111"]}
+
+    def _init_affixes(self, affix_set): #selects the active affix list (None disables affixes entirely)
+        if affix_set is None:
+            return
+        sets = self._affix_sets()
+        name = next(iter(sets)) if affix_set is _USE_FIRST_AFFIX_SET else str(affix_set)
+        if name not in sets:
+            self.logger.error(f'Unknown affix-set "{name}". Available: {", ".join(sets)}')
+            sys_exit(1)
+        entries = [str(a) for a in sets[name] if str(a) != ""]
+        if not entries:
+            self.logger.error(f'Affix-set "{name}" is empty.')
+            sys_exit(1)
+        self.affixes_list = entries
+        self.affix_set_name = name
+
     def main(self):
         pending = []
         written = 0
@@ -197,6 +223,8 @@ class PasswordDictGenerator():
             self._psf = self._decoration_factor() #fixed per-cased-form expansion factor for projection
             if not self.flags["quiet"]:
                 self.logger.info(f'Sign set "{self.sign_set_name}" active ({len(self.signs_list)} sign(s)).')
+            if self.affixes_list and not self.flags["quiet"]:
+                self.logger.info(f'Affix set "{self.affix_set_name}" active ({len(self.affixes_list)} affix(es)).')
             if self.sub_rules:
                 if not self.flags["quiet"]:
                     self.logger.info(f'Substitution preset "{self.sub_preset_name}" active ({sum(len(v) for v in self.sub_rules.values())} rule(s)).')
@@ -204,8 +232,8 @@ class PasswordDictGenerator():
                     self.logger.warning("Substitution preset active: -l/--all/-d/-at substitutions are disabled to avoid duplication.")
             if self.input == stdin and not self.flags["quiet"]:
                 self.logger.info("Insert input, one per line. Finish with a newline plus ctrl+c:")
+            lines = set()
             try:
-                lines=set()
                 for line in self.input: #read from choosen input
                     lines.add(line.strip())
             except KeyboardInterrupt: #allows th78e use of Ctrl+C as EOF
@@ -231,6 +259,7 @@ class PasswordDictGenerator():
                         if len(pending) >= flush_batch:
                             chunks_written += 1
                             chunk_count = len(pending)
+                            fname = ""
                             if chunked_to_files:
                                 fname = self._write_chunk(pending, chunks_written)
                             else:
@@ -271,12 +300,19 @@ class PasswordDictGenerator():
         s = len(self.signs_list)
         factor = (2 * s) + (s * s)           # year_signs without years: signs + surround
         if self._year:
-            yv = 4 * len(self._year)         # year variants per direction
+            yv = 4 * len(self._year)         # year variants per direction (4-digit, reversed, 2-digit, reversed 2-digit)
             factor += 2 * yv                 # bare year_after + year_before
             factor += yv * (2 * s + s * s)   # year_after -> signs + surround
             factor += s * 2 * yv             # signs_after -> year both modes
             factor += yv * (s + s * s)       # year_before -> signs(mode2) + surround
             factor += s * yv                 # signs_before -> year(mode2)
+        if self.affixes_list:
+            av = len(self.affixes_list)      # one variant per affix per direction
+            factor += 2 * av                 # bare affix_after + affix_before
+            factor += av * (2 * s + s * s)   # affix_after -> signs + surround
+            factor += s * 2 * av             # signs_after -> affix both modes
+            factor += av * (s + s * s)       # affix_before -> signs(mode2) + surround
+            factor += s * av                 # signs_before -> affix(mode2)
         return factor
 
     def _cased_forms(self, w): #the distinct cased forms of a seed that get decorated by base()
@@ -392,6 +428,23 @@ class PasswordDictGenerator():
                 yield from self.surround(x) #combination of sign+(year+word)+sign
             for x in signs_before:
                 yield from self.year(x, 2) #combination of year+sign+word
+        if self.affixes_list:
+            affix_after  = list(self.affix(w1, 1)) #materialized: iterated more than once below
+            affix_before = list(self.affix(w1, 2))
+            yield from affix_after
+            yield from affix_before
+            for x in affix_after:
+                yield from self.signs(x, 1) #word+affix+sign
+                yield from self.signs(x, 2) #sign+word+affix
+                yield from self.surround(x) #sign+(word+affix)+sign
+            for x in signs_after:
+                yield from self.affix(x, 1) #word+sign+affix
+                yield from self.affix(x, 2) #affix+word+sign
+            for x in affix_before:
+                yield from self.signs(x, 2) #sign+affix+word
+                yield from self.surround(x) #sign+(affix+word)+sign
+            for x in signs_before:
+                yield from self.affix(x, 2) #affix+sign+word
 
     def year(self, word,mode): #lazily yields combinations of the word and the year(s)
         for y in self._year:
@@ -406,6 +459,13 @@ class PasswordDictGenerator():
                 yield sy[::-1]+word    #combination of reversed year with 4 digits + word
                 yield sy[2:]+word      #combination of year with 2 digits + word
                 yield sy[2:][::-1]+word #combination of reversed year with 2 digits + word
+
+    def affix(self, word, mode): #lazily yields combinations of the word and short affix strings (e.g. "1", "123", "007")
+        for af in self.affixes_list:
+            if mode == 1:
+                yield f"{word}{af}" #word+affix
+            else:
+                yield f"{af}{word}" #affix+word
 
     def signs(self, word, mode): #lazily yields combinations of the word and signs
         for x in self.signs_list:
@@ -492,6 +552,8 @@ def arg_parser():
                         help='Enable per-instance, case-sensitive substitutions from a preset in passgen.json (or built-in). Without a name, uses the first preset. Mutually exclusive with -l/--all/-d/-at.')
     parser.add_argument('-ss','--sign-set', dest='sign_set', default=None,
                         help='Name of the sign set to use from passgen.json (or built-in). Defaults to the first sign set.')
+    parser.add_argument('-af','--affix-set', dest='affix_set', nargs='?', const=_USE_FIRST_AFFIX_SET, default=None,
+                        help='Append/prepend short numeric strings from a named affix set in passgen.json and combine them with sign decorations. Without a name, uses the first set.')
     parser.add_argument('-min','--minimum',dest='_min',action='store', type=int, default=1, help='Minimum length of password. Default=1')
     parser.add_argument('-max','--maximum',dest='_max',action='store', type=int, default=200, help='Maximum length of password. Default=200')
     parser.add_argument('-c','--combine', dest='combine', type=int, nargs='?', const=2, default=0,

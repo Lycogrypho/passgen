@@ -12,8 +12,10 @@ Here are some features of PassGen:
 - **Leet speak substitution** (`-l`) — replaces letters with their numeric equivalents: `a→4`, `e→3`, `i→1`, `o→0`, `s→5`, `t→7`. All non-empty subsets of applicable substitutions are applied, generating every combination.
 - **Dollar substitution** (`-d`) — replaces `s`/`S` with `$`.
 - **At substitution** (`-at`) — replaces `a`/`A` with `@`.
+- **Per-instance substitution** (`-sp`) — an alternative to leet that applies character substitution rules one occurrence at a time and case-sensitively, so every independent combination is generated (e.g. `event` → `3vent`, `ev3nt`, `3v3nt`, …). Rules are loaded from named presets in `passgen.json`, supporting many-to-one (`I`/`l`→`1`) and one-to-many (`a`→`4` or `@`) mappings. Mutually exclusive with `-l`/`--all`/`-d`/`-at`.
 - **Year combinations** (`-y`) — appends and prepends a year (4-digit, 2-digit, and their reverses) to each variant, including combinations with punctuation.
-- **Punctuation symbols** — appends and prepends each of 35 punctuation characters to every variant.
+- **Affix padding** (`-af`) — appends and prepends short strings (e.g. `1`, `123`, `007`) to every variant and cross-combines them with punctuation decorations, covering common patterns such as `password123!` or `!password123`. Affix sets are defined in `passgen.json`; the built-in default set includes `1`, `12`, `123`, `1234`, `0`, `00`, `01`, `007`, `69`, `111`.
+- **Punctuation symbols** — appends, prepends, and surrounds every variant with punctuation characters. The active set is chosen with `-ss` from `passgen.json` (default: 35 characters); smaller sets reduce output sharply since the surround operation scales with the square of the set size.
 - **Multi-word phrases** — input phrases with spaces generate both joined (`word1word2`) and underscore-separated (`word1_word2`) variants.
 - **Keyword combination** (`-c`) — combines input keywords into groups of N (default: 2, max: 3), generating all permutations before applying transformations. Useful for assembling candidate phrases from a pool of keywords.
 - **Chunked output** (`-s`) — when used with `-o`, writes each batch of N passwords to a separate numbered file (e.g. `wordlist_001.txt`, `wordlist_002.txt`, …). This keeps individual files at a manageable size and allows starting the hashcat steps (see below) with the first chunk while PassGen generates the rest.
@@ -28,8 +30,9 @@ PassGen is a command-line program. You can call it with the following arguments:
 
 ```
 usage: passgen.py [-h] [-i [INPUT]] [-o [OUTPUT]] [-y [YEAR]] [--all] [-d]
-                  [-at] [-l] [-min MIN] [-max MAX] [-c [COMBINE]]
-                  [-s [CHUNK_SIZE]] [-q | -v]
+                  [-at] [-l] [-sp [SUB_PRESET]] [-ss SIGN_SET]
+                  [-af [AFFIX_SET]] [-min MIN] [-max MAX] [-c [COMBINE]]
+                  [-s [CHUNK_SIZE]] [-f] [-q | -v]
 
 Creates a custom password wordlist from a set of keywords and phrases.
 
@@ -49,6 +52,19 @@ optional arguments:
   -d, --dollar          Replaces s and S with $.
   -at                   Replaces a and A with @.
   -l, --l337, --l33t    Replaces letters with numbers.
+  -sp [SUB_PRESET], --sub-preset [SUB_PRESET]
+                        Enable per-instance, case-sensitive substitutions from
+                        a named preset in passgen.json (or built-in). Without
+                        a name, uses the first preset. Mutually exclusive with
+                        -l/--all/-d/-at.
+  -ss SIGN_SET, --sign-set SIGN_SET
+                        Name of the punctuation set from passgen.json to use.
+                        Defaults to the first set.
+  -af [AFFIX_SET], --affix-set [AFFIX_SET]
+                        Append/prepend short strings (e.g. 1, 123, 007) from
+                        a named set in passgen.json and cross-combine them with
+                        punctuation decorations. Without a name, uses the first
+                        set.
   -min MIN, --minimum MIN
                         Minimum length of password. Default=1
   -max MAX, --maximum MAX
@@ -60,6 +76,8 @@ optional arguments:
                         When used with -o, write each chunk of N passwords to
                         a separate numbered file. Default when specified:
                         1000000.
+  -f, --force           Generate even if a word's projected expansion exceeds
+                        the safety cap.
   -q, --quiet           Suppresses informative output.
   -v, --verbose         Adds more informative output.
 ```
@@ -134,7 +152,7 @@ It reads a `passtest.json` configuration file (next to the script, or passed wit
 - `wordlist` — the base name, so it watches for `wordlist_###.txt`;
 - `header_bin` — the volume header extracted in Step 1;
 - `hcat_path` — the path to the hashcat executable;
-- a list of hashcat jobs (each with its `mode`, an optional GPU `device`, and optional extra `args`).
+- a list of hashcat jobs (each with its `mode`, an optional GPU `device`, optional extra `args`, and an optional `rules` list of hashcat rule files).
 
 What it does:
 1. **Monitors** `dict_dir` for `wordlist_###.txt` files (skipping ones already marked `DONE_`), oldest first.
@@ -163,6 +181,19 @@ A minimal `passtest.json` for a VeraCrypt volume across three GPUs:
   ]
 }
 ```
+
+The `rules` field lets you attach one or more hashcat rule files to a job. Rule files are resolved relative to `passtest.json` if the path is not absolute:
+
+```json
+{
+  "jobs": [
+    {"mode": 13711, "device": 1, "args": [], "rules": ["rules/best64.rule"]},
+    {"mode": 13721, "device": 2, "args": [], "rules": ["rules/best64.rule", "rules/toggles1.rule"]}
+  ]
+}
+```
+
+Using hashcat rules is an efficient complement to passgen's wordlist: passgen produces semantically meaningful candidates from your keywords, while rules like `best64.rule` apply mechanical mutations (append digits, toggle case, reverse) on the fly without inflating the wordlist file.
 
 Notes:
 - Running several hashcat instances at once only helps when each targets a **different physical GPU** (`device`). On a single GPU the instances just contend for it, so give every job the same (or no) `device` and they run one after another.
