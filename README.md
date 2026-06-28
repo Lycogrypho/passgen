@@ -16,7 +16,10 @@ Here are some features of PassGen:
 - **Year combinations** (`-y`) — appends and prepends a year (4-digit, 2-digit, and their reverses) to each variant, including combinations with punctuation.
 - **Affix padding** (`-af`) — appends and prepends short strings (e.g. `1`, `123`, `007`) to every variant and cross-combines them with punctuation decorations, covering common patterns such as `password123!` or `!password123`. Affix sets are defined in `passgen.json`; the built-in default set includes `1`, `12`, `123`, `1234`, `0`, `00`, `01`, `007`, `69`, `111`.
 - **Punctuation symbols** — appends, prepends, and surrounds every variant with punctuation characters. The active set is chosen with `-ss` from `passgen.json` (default: 35 characters); smaller sets reduce output sharply since the surround operation scales with the square of the set size.
-- **Multi-word phrases** — input phrases with spaces generate both joined (`word1word2`) and underscore-separated (`word1_word2`) variants.
+- **Word doubling** (`-db`) — for single-word inputs, adds a doubled form as an extra seed before applying all other transformations (e.g. `pippo` also generates from `pippopippo`). Also enabled by `--all`.
+- **Word reversal** (`-rv`) — for single-word inputs, adds the reversed form as an extra seed (e.g. `pippo` → also generates from `oppip`). Also enabled by `--all`.
+- **Prefix/suffix expansion** (`-ps`) — prepends and appends each entry from a named set in `passgen.json` to every keyword, then applies the full transformation pipeline to each resulting form (e.g. `common` set: `mypippo`, `pippomy`, `newpippo`, …). Sets are defined under `prefix_suffix_sets` in `passgen.json`.
+- **Multi-word phrases** — input phrases with spaces generate joined (`word1word2`) and separator-joined variants. The separators are configurable in `passgen.json` under `word_separators` (default: `_`, `.`, `-`, `+`).
 - **Keyword combination** (`-c`) — combines input keywords into groups of N (default: 2, max: 3), generating all permutations before applying transformations. Useful for assembling candidate phrases from a pool of keywords.
 - **Chunked output** (`-s`) — when used with `-o`, writes each batch of N passwords to a separate numbered file (e.g. `wordlist_001.txt`, `wordlist_002.txt`, …). This keeps individual files at a manageable size and allows starting the hashcat steps (see below) with the first chunk while PassGen generates the rest.
 
@@ -31,8 +34,9 @@ PassGen is a command-line program. You can call it with the following arguments:
 ```
 usage: passgen.py [-h] [-i [INPUT]] [-o [OUTPUT]] [-y [YEAR]] [--all] [-d]
                   [-at] [-l] [-sp [SUB_PRESET]] [-ss SIGN_SET]
-                  [-af [AFFIX_SET]] [-min MIN] [-max MAX] [-c [COMBINE]]
-                  [-s [CHUNK_SIZE]] [-f] [-q | -v]
+                  [-af [AFFIX_SET]] [-ps [PREFIX_SUFFIX]]
+                  [-min MIN] [-max MAX] [-c [COMBINE]]
+                  [-s [CHUNK_SIZE]] [-db] [-rv] [-f] [-q | -v]
 
 Creates a custom password wordlist from a set of keywords and phrases.
 
@@ -65,6 +69,11 @@ optional arguments:
                         a named set in passgen.json and cross-combine them with
                         punctuation decorations. Without a name, uses the first
                         set.
+  -ps [PREFIX_SUFFIX], --prefix-suffix [PREFIX_SUFFIX]
+                        Prepend and append each entry from a named set in
+                        passgen.json to every keyword before other
+                        transformations (e.g. my, new, old). Without a name,
+                        uses the first set.
   -min MIN, --minimum MIN
                         Minimum length of password. Default=1
   -max MAX, --maximum MAX
@@ -76,6 +85,10 @@ optional arguments:
                         When used with -o, write each chunk of N passwords to
                         a separate numbered file. Default when specified:
                         1000000.
+  -db, --double         Append a doubled form of each single-word keyword
+                        (e.g. pippo → pippopippo). Also enabled by --all.
+  -rv, --reverse        Append a reversed form of each single-word keyword
+                        (e.g. pippo → oppip). Also enabled by --all.
   -f, --force           Generate even if a word's projected expansion exceeds
                         the safety cap.
   -q, --quiet           Suppresses informative output.

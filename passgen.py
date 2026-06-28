@@ -13,6 +13,8 @@ from os.path import isfile, splitext, dirname, abspath, join
 _USE_FIRST_PRESET = "\x00first"
 # Sentinel meaning "-af was given without a name": use the first affix set in the config.
 _USE_FIRST_AFFIX_SET = "\x00first_affix"
+# Sentinel meaning "-ps was given without a name": use the first prefix/suffix set in the config.
+_USE_FIRST_PS_SET = "\x00first_ps"
 
 
 class Logger():
@@ -89,7 +91,7 @@ class PasswordDictGenerator():
         ],
     }
 
-    def __init__(self, _input=None, _output=None, year=None, _all=False, dollar=False, at=False, l337=False, _min: int=1, _max: int=200, quiet=False, verbose=False, combine=0, chunk_size=0, force=False, sub_preset=None, sign_set=None, affix_set=None):
+    def __init__(self, _input=None, _output=None, year=None, _all=False, dollar=False, at=False, l337=False, _min: int=1, _max: int=200, quiet=False, verbose=False, combine=0, chunk_size=0, force=False, sub_preset=None, sign_set=None, affix_set=None, double=False, reverse=False, prefix_suffix=None):
         self.input = _input
         self.output_path = _output                          # str path, or None for stdout
         self.output = stdout if _output is None else None   # opened lazily in main()
@@ -105,7 +107,9 @@ class PasswordDictGenerator():
             "quiet": quiet,
             "verbose": verbose,
             "combine": combine if combine and combine >= 2 else 0,
-            "force": force
+            "force": force,
+            "double": double,
+            "reverse": reverse
         }
         self._psf = None  # per-cased-form decoration factor, computed once in main() after year dedup
         self._config = None               # parsed passgen.json, lazily loaded and cached
@@ -119,6 +123,11 @@ class PasswordDictGenerator():
         self.affix_set_name = None        # name of the active affix set, for logging
         self.affixes_list = []            # active list of number/string affixes; empty = disabled
         self._init_affixes(affix_set)
+        self.separators_list = []         # inter-word join separators for multi-word inputs
+        self._init_separators()
+        self.prefix_suffix_set_name = None  # name of the active prefix/suffix set, for logging
+        self.prefix_suffix_list = []        # active list of strings prepended/appended to every seed; empty = disabled
+        self._init_prefix_suffix(prefix_suffix)
 
     def _write_chunk(self, data, chunk_num): #writes a chunk to a numbered output file and returns its path
         stem, ext = splitext(self.output_path)
@@ -208,6 +217,34 @@ class PasswordDictGenerator():
         self.affixes_list = entries
         self.affix_set_name = name
 
+    def _init_separators(self): #loads the inter-word separator list from config; falls back to ["_"] (original behaviour)
+        raw = self._load_config().get('word_separators')
+        if isinstance(raw, list) and raw:
+            self.separators_list = [str(s) for s in raw]
+        else:
+            self.separators_list = ["_"]
+
+    def _prefix_suffix_sets(self): #the prefix/suffix sets from config, or a single built-in fallback set
+        sets = self._load_config().get('prefix_suffix_sets')
+        if isinstance(sets, dict) and sets:
+            return sets
+        return {"common": ["my", "new", "old", "the", "super", "best", "top", "123", "2024"]}
+
+    def _init_prefix_suffix(self, prefix_suffix): #selects the active prefix/suffix list (None disables the feature entirely)
+        if prefix_suffix is None:
+            return
+        sets = self._prefix_suffix_sets()
+        name = next(iter(sets)) if prefix_suffix is _USE_FIRST_PS_SET else str(prefix_suffix)
+        if name not in sets:
+            self.logger.error(f'Unknown prefix-suffix set "{name}". Available: {", ".join(sets)}')
+            sys_exit(1)
+        entries = [str(e) for e in sets[name] if str(e) != ""]
+        if not entries:
+            self.logger.error(f'Prefix-suffix set "{name}" is empty.')
+            sys_exit(1)
+        self.prefix_suffix_list = entries
+        self.prefix_suffix_set_name = name
+
     def main(self):
         pending = []
         written = 0
@@ -225,6 +262,8 @@ class PasswordDictGenerator():
                 self.logger.info(f'Sign set "{self.sign_set_name}" active ({len(self.signs_list)} sign(s)).')
             if self.affixes_list and not self.flags["quiet"]:
                 self.logger.info(f'Affix set "{self.affix_set_name}" active ({len(self.affixes_list)} affix(es)).')
+            if self.prefix_suffix_list and not self.flags["quiet"]:
+                self.logger.info(f'Prefix/suffix set "{self.prefix_suffix_set_name}" active ({len(self.prefix_suffix_list)} entries).')
             if self.sub_rules:
                 if not self.flags["quiet"]:
                     self.logger.info(f'Substitution preset "{self.sub_preset_name}" active ({sum(len(v) for v in self.sub_rules.values())} rule(s)).')
@@ -353,10 +392,23 @@ class PasswordDictGenerator():
             words.append(w.capitalize())
         w = ''.join(words)
         seeds = {w, w.lower()}
-        if len(words) > 1: #multi-word phrase: also offer underscore-joined variants
-            joined = '_'.join(words)
-            seeds.add(joined)
-            seeds.add(joined.lower())
+        if (self.flags["double"] or self.flags["all"]) and len(words) == 1:
+            seeds.add(w + w)
+            seeds.add(w.lower() + w.lower())
+        if (self.flags["reverse"] or self.flags["all"]) and len(words) == 1:
+            seeds.add(w[::-1])
+            seeds.add(w.lower()[::-1])
+        if self.prefix_suffix_list:
+            for ps in self.prefix_suffix_list:
+                seeds.add(ps + w)
+                seeds.add(ps + w.lower())
+                seeds.add(w + ps)
+                seeds.add(w.lower() + ps)
+        if len(words) > 1: #multi-word phrase: join with each configured separator
+            for sep in self.separators_list:
+                joined = sep.join(words)
+                seeds.add(joined)
+                seeds.add(joined.lower())
         sub_active = bool(self.sub_rules)
         leet_active = (self.flags["l337"] or self.flags["all"]) and not sub_active
         if leet_active:
@@ -554,12 +606,16 @@ def arg_parser():
                         help='Name of the sign set to use from passgen.json (or built-in). Defaults to the first sign set.')
     parser.add_argument('-af','--affix-set', dest='affix_set', nargs='?', const=_USE_FIRST_AFFIX_SET, default=None,
                         help='Append/prepend short numeric strings from a named affix set in passgen.json and combine them with sign decorations. Without a name, uses the first set.')
+    parser.add_argument('-ps','--prefix-suffix', dest='prefix_suffix', nargs='?', const=_USE_FIRST_PS_SET, default=None,
+                        help='Prepend and append each entry in a named set from passgen.json to every keyword (e.g. my, new, old). Without a name, uses the first set.')
     parser.add_argument('-min','--minimum',dest='_min',action='store', type=int, default=1, help='Minimum length of password. Default=1')
     parser.add_argument('-max','--maximum',dest='_max',action='store', type=int, default=200, help='Maximum length of password. Default=200')
     parser.add_argument('-c','--combine', dest='combine', type=int, nargs='?', const=2, default=0,
                         help='Combine input keywords into groups of N words before generating (2 or 3). Default when specified: 2.')
     parser.add_argument('-s','--chunk-size', dest='chunk_size', type=int, nargs='?', const=1000000, default=0,
                         help='When used with -o, write each chunk of N passwords to a separate numbered file. Default when specified: 1000000.')
+    parser.add_argument('-db','--double', dest='double', action='store_true', help='Append a doubled form of each single-word keyword (e.g. pippo -> pippopippo).')
+    parser.add_argument('-rv','--reverse', dest='reverse', action='store_true', help='Append a reversed form of each single-word keyword (e.g. pippo -> oppip).')
     parser.add_argument('-f','--force', dest='force', action='store_true', help='Generate even for input words whose projected expansion exceeds the safety cap.')
     group=parser.add_mutually_exclusive_group()
     group.add_argument('-q','--quiet',dest='quiet',action='store_true', help='Suppresses informative output.')

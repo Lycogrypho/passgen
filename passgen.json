@@ -1,5 +1,10 @@
 {
   "_comment": "passgen configuration. 'presets' feeds -sp/--sub-preset: each preset is a list of {from, to} rules applied per-instance and case-sensitively (list 'a' and 'A' separately); rules may be many-to-one (i, I, l, L -> 1) or one-to-many (a -> 4 or @). 'sign_sets' feeds -ss/--sign-set: each entry is a list of punctuation characters appended/prepended/surrounding every word. The first entry in each section is the default when the flag is omitted (or given without a name, for -sp).",
+  "word_separators": ["_", ".", "-", "+"],
+  "prefix_suffix_sets": {
+    "common": ["my", "new", "old", "the", "super", "best", "top", "123", "2024"],
+    "minimal": ["my", "new", "old"]
+  },
   "affix_sets": {
     "default": ["1", "12", "123", "1234", "0", "00", "01", "007", "69", "111"],
     "short":   ["1", "12", "0", "01", "00"]
