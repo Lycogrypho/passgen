@@ -161,17 +161,17 @@ I found that the wordlists generated with PassGen may easily explode in milions 
 In my lziness, I came with `passtest.py` to automates the whole loop:
 
 It reads a `passtest.json` configuration file (next to the script, or passed with `-c`) that specifies at least:
-- `dict_dir` — the directory to monitor for wordlist chunks;
-- `wordlist` — the base name, so it watches for `wordlist_###.txt`;
 - `header_bin` — the volume header extracted in Step 1;
 - `hcat_path` — the path to the hashcat executable;
-- a list of hashcat jobs (each with its `mode`, an optional GPU `device`, optional extra `args`, and an optional `rules` list of hashcat rule files).
+- a list of hashcat jobs (each with its `mode`, an optional `attack_mode`, an optional GPU `device`, optional extra `args`, an optional `rules` list of hashcat rule files, and — for mask attacks — a `mask` string).
+- `dict_dir` and `wordlist` — required only when dictionary jobs (`attack_mode: 0`) are present.
 
 What it does:
-1. **Monitors** `dict_dir` for `wordlist_###.txt` files (skipping ones already marked `DONE_`), oldest first.
-2. For each chunk it **runs hashcat** once per configured job against `header_bin`. Jobs pinned to different GPUs run **in parallel** (one hashcat instance per device); jobs sharing a device run sequentially.
-3. If a password is **found**, it prints it to stdout, records it in the found file, and exits.
-4. Otherwise it marks the chunk done by renaming it `DONE_wordlist_###.txt` and moves on to the next. When no chunk is left it keeps polling, so you can start `passtest` as soon as PassGen writes its first chunk and let the two run side by side.
+1. **Mask jobs first** — if any jobs have `attack_mode: 3`, passtest runs them once at startup (each mask is a full brute-force sweep over the configured character-set pattern). Jobs pinned to different GPUs run **in parallel**; jobs sharing a device run sequentially.
+2. If a password is **found**, it prints it to stdout, records it in the found file, and exits.
+3. **Dictionary loop** — if any jobs have `attack_mode: 0` (the default), passtest **monitors** `dict_dir` for `wordlist_###.txt` files (skipping ones already marked `DONE_`), oldest first. For each chunk it runs hashcat once per configured dictionary job against `header_bin`, again parallel across GPUs.
+4. If a password is **found**, it prints it to stdout, records it in the found file, and exits.
+5. Otherwise it marks the chunk done by renaming it `DONE_wordlist_###.txt` and moves on to the next. When no chunk is left it keeps polling, so you can start `passtest` as soon as PassGen writes its first chunk and let the two run side by side.
 
 Example: start PassGen streaming chunks, then start the watcher:
 
@@ -207,6 +207,27 @@ The `rules` field lets you attach one or more hashcat rule files to a job. Rule 
 ```
 
 Using hashcat rules is an efficient complement to passgen's wordlist: passgen produces semantically meaningful candidates from your keywords, while rules like `best64.rule` apply mechanical mutations (append digits, toggle case, reverse) on the fly without inflating the wordlist file.
+
+**Mask attacks** (`attack_mode: 3`) run a full brute-force sweep over a character-set pattern without any wordlist. Add `"attack_mode": 3` and a `"mask"` string to a job; passtest runs these once at startup, before moving on to dictionary jobs. `dict_dir` and `wordlist` may be omitted from the configuration if only mask jobs are configured.
+
+Hashcat mask syntax: `?l` = lowercase letter, `?u` = uppercase, `?d` = digit, `?s` = special character, `?a` = all printable. Custom charsets can be defined in `args` with `-1`, `-2`, etc.
+
+```json
+{
+  "header_bin": "header.bin",
+  "hcat_path": "hashcat",
+  "jobs": [
+    {"mode": 6211, "device": 1, "attack_mode": 3, "mask": "?l?l?l?l?d?d"},
+    {"mode": 6211, "device": 1, "attack_mode": 3, "mask": "?u?l?l?l?d?d?s"},
+    {"mode": 6211, "device": 2, "attack_mode": 0, "rules": ["rules/best64.rule"]},
+    {"mode": 6221, "device": 2, "attack_mode": 0}
+  ],
+  "dict_dir": "wordlists",
+  "wordlist": "wordlist"
+}
+```
+
+In the example above, GPU 1 runs the two mask sweeps sequentially first; if neither finds the password, GPU 2 starts testing dictionary chunks (with and without rules) in parallel.
 
 Notes:
 - Running several hashcat instances at once only helps when each targets a **different physical GPU** (`device`). On a single GPU the instances just contend for it, so give every job the same (or no) `device` and they run one after another.

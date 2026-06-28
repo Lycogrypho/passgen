@@ -33,7 +33,7 @@ from datetime import datetime
 LOG = logging.getLogger("passtest")
 
 DEFAULT_CONFIG_NAME = "passtest.json"
-REQUIRED_KEYS = ("dict_dir", "wordlist", "header_bin", "hcat_path")
+REQUIRED_KEYS = ("header_bin", "hcat_path")  # dict_dir/wordlist only required when dictionary jobs are present
 
 
 def setup_logging(verbose=False):
@@ -53,8 +53,8 @@ class Passtest:
 
     def __init__(self, config, config_dir):
         self.config_dir = Path(config_dir)
-        self.dict_dir = self._resolve(config["dict_dir"])
-        self.stem = str(config["wordlist"])
+        self.dict_dir = self._resolve(config["dict_dir"]) if "dict_dir" in config else None
+        self.stem = str(config.get("wordlist", ""))
         self.header_bin = self._resolve(config["header_bin"])
         self.hcat_path: str = str(config["hcat_path"])
         self.poll_interval = float(config.get("poll_interval", 5))
@@ -62,9 +62,12 @@ class Passtest:
         self.out_dir = self._resolve(config.get("out_dir", ".passtest_out"))
         self.extra_global = [str(a) for a in config.get("hcat_args", [])]  # appended to every job
         self.jobs = self._build_jobs(config)
-        self.job_groups = self._group_by_device(self.jobs)
+        self.mask_jobs = [j for j in self.jobs if j["attack_mode"] == 3]
+        self.dict_jobs  = [j for j in self.jobs if j["attack_mode"] == 0]
+        self.mask_job_groups = self._group_by_device(self.mask_jobs)
+        self.dict_job_groups = self._group_by_device(self.dict_jobs)
         # matches "<stem>_<digits>.txt" but NOT "DONE_<stem>_<digits>.txt"
-        self._wl_re = re.compile(r"^" + re.escape(self.stem) + r"_(\d+)\.txt$", re.IGNORECASE)
+        self._wl_re = re.compile(r"^" + re.escape(self.stem) + r"_(\d+)\.txt$", re.IGNORECASE) if self.stem else None
         self._procs_lock = threading.Lock()
         self._active_procs = set()
         self._shutdown = False
@@ -78,7 +81,7 @@ class Passtest:
     def _build_jobs(self, config):
         jobs = []
         raw = config.get("jobs")
-        if raw:  # preferred form: a list of {mode, device?, args?}
+        if raw:  # preferred form: a list of {mode, attack_mode?, mask?, device?, args?, rules?}
             for j in raw:
                 mode = j.get("mode")
                 if mode is None:
@@ -87,7 +90,14 @@ class Passtest:
                 rules_raw = j.get("rules", [])
                 if isinstance(rules_raw, str):
                     rules_raw = [rules_raw]
+                attack_mode = int(j.get("attack_mode", 0))
+                mask = str(j["mask"]) if "mask" in j else None
+                if attack_mode == 3 and not mask:
+                    LOG.error("Job with attack_mode 3 requires a 'mask' field: %r", j)
+                    sys.exit(1)
                 jobs.append({"mode": int(mode),
+                             "attack_mode": attack_mode,
+                             "mask": mask,
                              "device": j.get("device"),
                              "args": [str(a) for a in j.get("args", [])],
                              "rules": [str(self._resolve(r)) for r in rules_raw]})
@@ -96,6 +106,8 @@ class Passtest:
             devices = config.get("devices") or [None]
             for i, mode in enumerate(modes):
                 jobs.append({"mode": int(mode),
+                             "attack_mode": 0,
+                             "mask": None,
                              "device": devices[i % len(devices)],
                              "args": [],
                              "rules": []})
@@ -125,8 +137,15 @@ class Passtest:
             if not any(os.access(os.path.join(d, exe), os.X_OK) for d in path_dirs):
                 LOG.error("hashcat not found on PATH: %s", exe)
                 sys.exit(1)
-        if not self.dict_dir.exists():
-            LOG.warning("dict_dir does not exist yet: %s (will keep polling)", self.dict_dir)
+        if self.dict_jobs:
+            if not self.dict_dir:
+                LOG.error("Dictionary jobs require 'dict_dir' in the configuration.")
+                sys.exit(1)
+            if not self.stem:
+                LOG.error("Dictionary jobs require 'wordlist' in the configuration.")
+                sys.exit(1)
+            if not self.dict_dir.exists():
+                LOG.warning("dict_dir does not exist yet: %s (will keep polling)", self.dict_dir)
 
     # ------------------------------------------------------------------ scanning
 
@@ -148,8 +167,21 @@ class Passtest:
     def run(self):
         self._validate_environment()
         self.out_dir.mkdir(parents=True, exist_ok=True)
-        LOG.info("Watching %s for %s_*.txt - %d job(s) across %d device group(s), every %.1fs.",
-                 self.dict_dir, self.stem, len(self.jobs), len(self.job_groups), self.poll_interval)
+        LOG.info("%d job(s): %d mask attack, %d dictionary.", len(self.jobs), len(self.mask_jobs), len(self.dict_jobs))
+
+        if self.mask_job_groups:
+            LOG.info("Running %d mask job(s)...", len(self.mask_jobs))
+            result = self._run_job_groups(self.mask_job_groups, wl=None)
+            if result:
+                self._handle_found(None, result)
+                return
+            LOG.info("Mask jobs exhausted — no password found.")
+
+        if not self.dict_job_groups:
+            LOG.info("No dictionary jobs configured; done.")
+            return
+        LOG.info("Watching %s for %s_*.txt — %d dictionary job(s) across %d device group(s), every %.1fs.",
+                 self.dict_dir, self.stem, len(self.dict_jobs), len(self.dict_job_groups), self.poll_interval)
         while not self._shutdown:
             pending = self._pending_wordlists()
             if not pending:
@@ -161,7 +193,7 @@ class Passtest:
                 if not wl.exists():  # raced with a rename; skip
                     continue
                 LOG.info("Testing %s ...", wl.name)
-                result = self._run_wordlist(wl)
+                result = self._run_job_groups(self.dict_job_groups, wl=wl)
                 if result:
                     self._handle_found(wl, result)
                     return  # success → stop
@@ -178,10 +210,11 @@ class Passtest:
     def _handle_found(self, wl, result):
         pw, job = result["password"], result["job"]
         dev = job["device"]
-        LOG.info("PASSWORD FOUND in %s (mode %s%s).", wl.name, job["mode"],
+        wl_desc = wl.name if wl is not None else f"mask({job.get('mask', '?')})"
+        LOG.info("PASSWORD FOUND in %s (mode %s%s).", wl_desc, job["mode"],
                  f", device {dev}" if dev is not None else "")
         stamp = datetime.now().strftime("%Y/%m/%d %H:%M:%S")
-        record = f"[{stamp}] wordlist={wl.name} mode={job['mode']} device={dev} password={pw}\n"
+        record = f"[{stamp}] source={wl_desc} mode={job['mode']} device={dev} password={pw}\n"
         try:
             with open(self.found_file, "a", encoding="utf-8") as f:
                 f.write(record)
@@ -194,12 +227,12 @@ class Passtest:
 
     # ------------------------------------------------------------------ hashcat
 
-    def _run_wordlist(self, wl):  # run all jobs for one chunk; return {password, job} or None
+    def _run_job_groups(self, job_groups, wl):  # run a set of device-grouped jobs; wl=None for mask attacks
         result = {"password": None, "job": None}
         found_event = threading.Event()
         lock = threading.Lock()
         threads = []
-        for jobs in self.job_groups.values():
+        for jobs in job_groups.values():
             t = threading.Thread(target=self._device_worker,
                                  args=(jobs, wl, result, found_event, lock),
                                  daemon=True)
@@ -223,9 +256,10 @@ class Passtest:
                 return
 
     def _build_cmd(self, job, wl, outfile, tag):
+        attack_mode = job["attack_mode"]
         cmd = [self.hcat_path,
                "-m", str(job["mode"]),
-               "-a", "0",                         # straight dictionary attack
+               "-a", str(attack_mode),
                "--quiet",
                "--potfile-disable",               # always actually run; no stale short-circuit
                "--restore-disable",               # parallel instances must not share restore state
@@ -238,11 +272,13 @@ class Passtest:
             cmd += ["-r", rule]
         cmd += job["args"]
         cmd += self.extra_global
-        cmd += [str(self.header_bin), str(wl)]     # hash (header) then dictionary
+        cmd.append(str(self.header_bin))
+        cmd.append(job["mask"] if attack_mode == 3 else str(wl))
         return cmd
 
     def _run_job(self, job, wl, found_event):
-        tag = re.sub(r"[^A-Za-z0-9_]", "_", f"{job['device']}_{job['mode']}_{wl.stem}")
+        wl_stem = wl.stem if wl is not None else "mask"
+        tag = re.sub(r"[^A-Za-z0-9_]", "_", f"{job['device']}_{job['mode']}_{wl_stem}")
         outfile = self.out_dir / f"cracked_{tag}.txt"
         errfile = self.out_dir / f"hcat_{tag}.log"
         try:
@@ -251,8 +287,9 @@ class Passtest:
         except OSError:
             pass
         cmd = self._build_cmd(job, wl, outfile, tag)
-        LOG.info("hashcat -m %s%s on %s", job["mode"],
-                 f" -d {job['device']}" if job["device"] is not None else "", wl.name)
+        wl_desc = wl.name if wl is not None else job.get("mask", "mask")
+        LOG.info("hashcat -m %s -a %s%s on %s", job["mode"], job["attack_mode"],
+                 f" -d {job['device']}" if job["device"] is not None else "", wl_desc)
         LOG.debug("command: %s", " ".join(cmd))
         try:
             err_fh = open(errfile, "w", encoding="utf-8", errors="replace")

@@ -1,0 +1,66 @@
+{
+  "_comment": "Example passtest configuration demonstrating mask attacks and rule-based dictionary attacks. Copy and adapt to your case. Rule file paths are resolved relative to this file if not absolute.",
+
+  "header_bin": "header.bin",
+  "hcat_path": "hashcat",
+  "poll_interval": 5,
+  "found_file": "found.txt",
+  "out_dir": ".passtest_out",
+  "hcat_args": ["-w", "3"],
+
+  "jobs": [
+    {
+      "_comment": "MASK — All 4-digit PINs: 0000–9999. Fast, worth trying first.",
+      "mode": 6211, "device": 1, "attack_mode": 3, "mask": "?d?d?d?d"
+    },
+    {
+      "_comment": "MASK — 6-digit PINs and short numeric codes (000000–999999).",
+      "mode": 6211, "device": 1, "attack_mode": 3, "mask": "?d?d?d?d?d?d"
+    },
+    {
+      "_comment": "MASK — Capitalised word of 5 lowercase letters + 2 digits (e.g. Pippo12).",
+      "mode": 6211, "device": 1, "attack_mode": 3, "mask": "?u?l?l?l?l?d?d"
+    },
+    {
+      "_comment": "MASK — Same pattern with a trailing special character (e.g. Pippo12!).",
+      "mode": 6211, "device": 1, "attack_mode": 3, "mask": "?u?l?l?l?l?d?d?s"
+    },
+    {
+      "_comment": "MASK — 6 lowercase + 2 digits, no capital (e.g. pippo12).",
+      "mode": 6211, "device": 1, "attack_mode": 3, "mask": "?l?l?l?l?l?l?d?d"
+    },
+    {
+      "_comment": "MASK — Custom charset (-1 = digits + common symbols); 5 lowercase + 3 chars from that set.",
+      "mode": 6211, "device": 1, "attack_mode": 3,
+      "mask": "?l?l?l?l?l?1?1?1",
+      "args": ["-1", "?d!@#$"]
+    },
+
+    {
+      "_comment": "DICT — Plain dictionary, no rules. Catches exact passgen candidates.",
+      "mode": 6211, "device": 2, "attack_mode": 0
+    },
+    {
+      "_comment": "DICT — best64.rule: 64 common mutations (append digits, toggle case, reverse, etc.).",
+      "mode": 6211, "device": 2, "attack_mode": 0,
+      "rules": ["rules/best64.rule"]
+    },
+    {
+      "_comment": "DICT — Two rule files stacked: best64 mutations then case-toggle variants.",
+      "mode": 6211, "device": 2, "attack_mode": 0,
+      "rules": ["rules/best64.rule", "rules/toggles1.rule"]
+    },
+    {
+      "_comment": "DICT — SHA-512 mode with best64 rules, on a third GPU.",
+      "mode": 6221, "device": 3, "attack_mode": 0,
+      "rules": ["rules/best64.rule"]
+    },
+    {
+      "_comment": "DICT — Whirlpool mode, plain dictionary.",
+      "mode": 6231, "device": 3, "attack_mode": 0
+    }
+  ],
+
+  "dict_dir": "wordlists",
+  "wordlist": "wordlist"
+}
