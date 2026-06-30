@@ -254,6 +254,9 @@ class PasswordDictGenerator():
         if not chunked_to_files and self.output_path:
             self.output = open(self.output_path, 'w')
         try:
+            if self.min > self.max:
+                self.logger.error(f'--minimum ({self.min}) cannot exceed --maximum ({self.max}).')
+                sys_exit(1)
             if self.flags["all"]: #check if --all flag has been set
                 self._year.append(datetime.now().year) #add the current year to the list
             self._year=list(set(self._year)) #remove duplicates if there's any
@@ -330,9 +333,13 @@ class PasswordDictGenerator():
             self.logger.info("\nCatched SIGINT. Exiting...")
             if self.input != stdin:
                 self.input.close()
-            if not chunked_to_files and self.output != stdout:
-                self.output.close()
             sys_exit(0)
+        finally:
+            if not chunked_to_files and self.output not in (None, stdout):
+                try:
+                    self.output.close()
+                except OSError:
+                    pass
 
 
     def _decoration_factor(self): #upper-bound estimate of candidates year_signs() produces for one word (projection only)
@@ -354,15 +361,21 @@ class PasswordDictGenerator():
             factor += s * av                 # signs_before -> affix(mode2)
         return factor
 
-    def _cased_forms(self, w): #the distinct cased forms of a seed that get decorated by base()
-        forms = [w, w.lower(), w.upper()]
-        if not w.istitle() or w.find('_') != -1: #avoid duplicate capitalize() when w is already a single title-cased word
-            forms.append(w.capitalize())
+    def _cased_forms(self, w): #the distinct cased forms of a seed; deduplicated so equal forms are not processed twice
+        seen = set()
+        forms = []
+        for f in (w, w.lower(), w.upper(), w.capitalize()):
+            if f not in seen:
+                seen.add(f)
+                forms.append(f)
         if self.hasVowel(w):
             uv = self.upperVowel(w)
-            forms.append(uv)
-            if w.capitalize() != uv.swapcase():
-                forms.append(uv.swapcase())
+            if uv not in seen:
+                seen.add(uv)
+                forms.append(uv)
+            sc = uv.swapcase()
+            if sc not in seen:
+                forms.append(sc)
         return forms
 
     def _sub_count(self, word): #number of substitution combinations (including the original) for projection
@@ -384,12 +397,9 @@ class PasswordDictGenerator():
                 yield cand
 
     def generate_for_line(self, line): #lazily yields every candidate for one input line (duplicates possible by design)
-        words = line.split()
+        words = [tok.capitalize() for tok in line.split()]
         if not words: #skip empty lines
             return
-        for _ in range(len(words)):
-            w = words.pop(0)
-            words.append(w.capitalize())
         w = ''.join(words)
         seeds = {w, w.lower()}
         if (self.flags["double"] or self.flags["all"]) and len(words) == 1:
@@ -442,6 +452,7 @@ class PasswordDictGenerator():
 
     def base(self, w): #lazily yields the cased + sign/year decorated forms of a seed word
         for cf in self._cased_forms(w):
+            yield cf                                # bare cased form (UPPER, Capitalize, upperVowel, etc.)
             yield from self.year_signs(cf)
             if self.sub_rules: #per-instance, case-sensitive substitution variants of this cased form
                 for sub in self.apply_subs(cf):
@@ -449,13 +460,10 @@ class PasswordDictGenerator():
                     yield from self.year_signs(sub) # and its sign/year decorations
 
     def hasVowel(self, word): #simple function that returns if a word has a vowel.
-        return any(x in word.lower() for x in ('a', 'e', 'i', 'o', 'u'))
+        return any(c in 'aeiouAEIOU' for c in word)
 
-    def upperVowel(self, word): #returns the word with all vowels uppercased
-        _word = word.lower()
-        for char in (x for x in ('a', 'e', 'i', 'o', 'u') if x in _word):
-            _word = _word.replace(char, char.upper())
-        return _word
+    def upperVowel(self, word): #returns the word with all vowels uppercased, rest lowercased
+        return ''.join(c.upper() if c in 'aeiouAEIOU' else c.lower() for c in word)
 
     def year_signs(self, w1): #lazily yields combinations of the word with signs and, if specified, the year(s)
         signs_after  = list(self.signs(w1, 1)) #materialized: iterated more than once below
@@ -532,8 +540,7 @@ class PasswordDictGenerator():
                 yield f"{s1}{word}{s2}"
 
     def _generic_sub(self, word, char, rep):
-        if word is not None:
-            return word.replace(char.lower(), rep).replace(char.upper(), rep)
+        return word.replace(char.lower(), rep).replace(char.upper(), rep)
 
     def l337_a(self, word): #returns the word with a vowel replaced with 4
         return self._generic_sub(word, "a", "4")
@@ -584,10 +591,9 @@ class PasswordDictGenerator():
         total=set()
         for i in range(j,len(l_list)):
             word=l_list[i](w)
-            if word is not None:
-                total.add(word)
-                if word != w:  # only recurse if the transformation changed the word
-                    total.update(self.fr_l337(word,l_list,i+1))
+            total.add(word)
+            if word != w:  # only recurse if the transformation changed the word
+                total.update(self.fr_l337(word,l_list,i+1))
         return total
 
 
@@ -620,7 +626,10 @@ def arg_parser():
     group=parser.add_mutually_exclusive_group()
     group.add_argument('-q','--quiet',dest='quiet',action='store_true', help='Suppresses informative output.')
     group.add_argument('-v','--verbose',dest='verbose',action='store_true', help='Adds more informative output.')
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.combine and args.combine not in (2, 3):
+        parser.error(f'--combine must be 2 or 3 (got {args.combine})')
+    return args
 
 if __name__ == "__main__":
     args = arg_parser()

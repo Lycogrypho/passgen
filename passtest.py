@@ -23,6 +23,8 @@ import re
 import sys
 import json
 import time
+import shutil
+import signal
 import logging
 import argparse
 import threading
@@ -133,8 +135,7 @@ class Passtest:
                 LOG.error("hashcat executable not found: %s", exe)
                 sys.exit(1)
         else:
-            path_dirs = (os.environ.get("PATH") or "").split(os.pathsep)
-            if not any(os.access(os.path.join(d, exe), os.X_OK) for d in path_dirs):
+            if shutil.which(exe) is None:
                 LOG.error("hashcat not found on PATH: %s", exe)
                 sys.exit(1)
         if self.dict_jobs:
@@ -277,8 +278,8 @@ class Passtest:
         return cmd
 
     def _run_job(self, job, wl, found_event):
-        wl_stem = wl.stem if wl is not None else "mask"
-        tag = re.sub(r"[^A-Za-z0-9_]", "_", f"{job['device']}_{job['mode']}_{wl_stem}")
+        suffix = wl.stem if wl is not None else re.sub(r"[^A-Za-z0-9_]", "_", job.get("mask", "mask"))
+        tag = re.sub(r"[^A-Za-z0-9_]", "_", f"{job['device']}_{job['mode']}_{suffix}")
         outfile = self.out_dir / f"cracked_{tag}.txt"
         errfile = self.out_dir / f"hcat_{tag}.log"
         try:
@@ -295,12 +296,13 @@ class Passtest:
             err_fh = open(errfile, "w", encoding="utf-8", errors="replace")
         except OSError as e:
             LOG.error("Could not open log %s: %s", errfile, e)
-            err_fh = subprocess.DEVNULL
+            err_fh = None
         try:
-            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=err_fh)
+            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                    stderr=err_fh if err_fh is not None else subprocess.DEVNULL)
         except OSError as e:
             LOG.error("Failed to launch hashcat (%s): %s", self.hcat_path, e)
-            if err_fh not in (subprocess.DEVNULL, None):
+            if err_fh is not None:
                 err_fh.close()
             return None
         with self._procs_lock:
@@ -317,17 +319,18 @@ class Passtest:
         finally:
             with self._procs_lock:
                 self._active_procs.discard(proc)
-            if err_fh not in (subprocess.DEVNULL, None):
+            if err_fh is not None:
                 err_fh.close()
 
         rc = proc.returncode
         pw = self._read_password(outfile)
         if pw is not None:
             return pw
+        target_desc = wl.name if wl is not None else f"mask({job.get('mask', '?')})"
         if rc == 1:
-            LOG.info("Exhausted: mode %s found nothing in %s.", job["mode"], wl.name)
+            LOG.info("Exhausted: mode %s found nothing in %s.", job["mode"], target_desc)
         elif rc == 0:
-            LOG.info("mode %s on %s finished with no password captured.", job["mode"], wl.name)
+            LOG.info("mode %s on %s finished with no password captured.", job["mode"], target_desc)
         else:
             LOG.warning("hashcat mode %s exited with code %s%s.", job["mode"], rc,
                         self._tail_hint(errfile))
@@ -411,6 +414,7 @@ def main():
 
     cfg = load_config(config_path)
     tester = Passtest(cfg, config_path.resolve().parent)
+    signal.signal(signal.SIGTERM, lambda _sig, _frame: (tester.shutdown(), sys.exit(143)))
     try:
         tester.run()
     except KeyboardInterrupt:

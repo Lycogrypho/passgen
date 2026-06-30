@@ -8,7 +8,7 @@ Here comes PassGen: while looking for a program to generate my personalized dict
 ## Features
 
 Here are some features of PassGen:
-- **Casing variants** — for each keyword, generates lowercase, uppercase, title case, and a vowel-uppercase variant (e.g. `pAssword`) along with its swapcase.
+- **Casing variants** — for each keyword, generates lowercase, uppercase, title case, and a vowel-uppercase variant (e.g. `pAssword`) along with its swapcase. Each form is emitted bare and as the base for all sign/year/affix combinations.
 - **Leet speak substitution** (`-l`) — replaces letters with their numeric equivalents: `a→4`, `e→3`, `i→1`, `o→0`, `s→5`, `t→7`. All non-empty subsets of applicable substitutions are applied, generating every combination.
 - **Dollar substitution** (`-d`) — replaces `s`/`S` with `$`.
 - **At substitution** (`-at`) — replaces `a`/`A` with `@`.
